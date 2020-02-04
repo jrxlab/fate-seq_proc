@@ -1,0 +1,349 @@
+---
+title: "Figures_Roux_ms_fate-seq_file_1"
+author: "Agnes Paquet"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width=7,fig.height = 5)
+```
+
+```{r}
+# load required package
+suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(gplots))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(SingleCellExperiment))
+suppressPackageStartupMessages(library(scater))
+suppressPackageStartupMessages(library(scran))
+suppressPackageStartupMessages(library(factoextra))
+suppressPackageStartupMessages(library(FactoMineR))
+
+
+```
+
+## Heatmap based on HVG
+
+Preprocessing using scran. HVG selected using Lun method, regardless of cell labels 
+
+Based on: https://bioconductor.org/packages/release/workflows/vignettes/simpleSingleCell/inst/doc/xtra-3-var.html
+
+
+```{r}
+
+setwd("C:/Users/Kevin/Projets/Collaborations/Roux/Figure_032019/Figures_01292020/")
+sc <- read.delim("GEO_RawCounts_LCMcells.txt", stringsAsFactors = F, row.names=1)
+serie <- read.delim(file = "serie.FinalN19_GEO_extended.txt", stringsAsFactors = F)
+
+## check that serie and count data are ordered the same
+ix <- match(serie$final.names,colnames(sc))
+## check cbind(serie$final.names,colnames(sc)[ix])
+
+sc <- sc[,ix] ## reorder the columns
+rm(ix);gc(T)
+
+pheno <- factor(serie$pheno, levels = c("Low","High"))
+names(pheno) = colnames(sc)
+ercc = grep("ERCC-", rownames(sc))
+
+mycols = brewer.pal(8,"Set1")
+
+annotation_col = data.frame(Pheno=serie$pheno,
+                            Batch = as.numeric(as.factor(serie$Sample.Date)))
+rownames(annotation_col) = serie$final.names
+
+ann_colors = list(Pheno = c(Low=mycols[2], High=mycols[1]),
+                  Batch=rainbow(8))
+
+```
+
+## Data normalization using scnorm/scran
+
+```{r}
+
+sce.hsc <- SingleCellExperiment(list(counts=as.matrix(sc)))
+dim(sce.hsc)
+
+is.spike <- grepl("^ERCC-", rownames(sce.hsc))
+isSpike(sce.hsc, "ERCC") <- is.spike
+summary(is.spike)
+
+to.keep <- nexprs(sce.hsc, byrow=TRUE) > 0
+sce.hsc <- sce.hsc[to.keep,]
+summary(to.keep)
+
+sce.hsc <- computeSumFactors(sce.hsc,min.mean=0.1, sizes=seq(3,5))
+summary(sizeFactors(sce.hsc))
+
+sce.hsc <- computeSpikeFactors(sce.hsc, type="ERCC", general.use=FALSE)
+summary(sizeFactors(sce.hsc, "ERCC"))
+
+sce.hsc <- normalize(sce.hsc)
+
+var.fit <- trendVar(sce.hsc, parametric=TRUE, loess.args=list(span=0.4))
+#var.out <- decomposeVar(sce.hsc, var.fit)
+var.out <- decomposeVar(sce.hsc, var.fit)
+
+## Plot the HVG curve
+plot(var.out$mean, var.out$total, pch=16, cex=0.6, xlab="Mean log-expression", 
+    ylab="Variance of log-expression")
+curve(var.fit$trend(x), col="dodgerblue", lwd=2, add=TRUE)
+cur.spike <- isSpike(sce.hsc)
+points(var.out$mean[cur.spike], var.out$total[cur.spike], col="red", pch=16)
+
+hvg.out <- var.out[which(var.out$p.value <= 0.05),]
+
+```
+
+## Normalized data for exploratory analysis
+
+Based on scran normalization, no ERCC
+
+```{r,fig.width=8,fig.height=10}
+norm <- logcounts(sce.hsc)
+ercc <- grep("ERCC-",rownames(norm))
+## Heatmap of normalized counts for HVG
+
+annotation_col = data.frame(Pheno=serie$pheno)
+rownames(annotation_col) = serie$final.names
+
+ann_colors = list(Pheno = c(Low=mycols[2], High=mycols[1]))
+
+hvg <- rownames(var.out[which(var.out$FDR <= 0.05),])
+
+pheatmap(norm[hvg,],scale="row",
+          annotation_col=annotation_col,
+          annotation_colors = ann_colors,
+          cluster_distance_cols = "correlation",
+          clustering_method = "ward.D",
+          fontsize_row=10,fontsize_col = 18)
+
+```
+
+
+## Cell cycle analysis
+
+Note: R code based on a blog post. Original code is available here:
+https://jdblischak.github.io/singleCellSeq/analysis/cell-cycle.html
+
+We used our own set of genes for cell cycle assessment.
+
+## Cell cycle assignment
+```{r, eval=T}
+cell_cycle_genes <- read.delim("Barbry-CellCycle_GeneSets.txt", stringsAsFactors = F)
+
+## create 5 lists of 5 phases (de-level and then remove "")
+cell_cycle_genes_list <- apply(cell_cycle_genes,2, 
+                               function(x){ temp <- gsub(" ","",x);return(temp[temp!=""])})
+
+## create phase score for each cell
+phase.score = c()
+for(i in 1:5)
+{
+  g1.s = cell_cycle_genes_list[[i]]
+  tmp.g1s = norm[rownames(norm) %in% g1.s,]
+  tmp.g1s = rbind(tmp.g1s, mean=colMeans(tmp.g1s))
+
+  ### use transpose to compute cor matrix
+  cor_matrix <- cor(t(tmp.g1s))
+
+  #### take the numbers for correlation of each genes with mean values for the set
+  cor_vector <- cor_matrix[,dim(cor_matrix)[1]]
+  #### restrict to correlation >= 0.3
+  tmp.g1s.filter <- norm[rownames(norm) %in% names(cor_vector[cor_vector >= 0.3]),]
+  g1s.score = colMeans(tmp.g1s.filter)
+  phase.score = cbind(phase.score, g1s.score)
+  rm(g1s.score, g1.s, tmp.g1s, tmp.g1s.filter)
+}
+colnames(phase.score) = names(cell_cycle_genes_list)
+
+## Normalization of score for each phase
+
+flexible_normalization <- function(data_in,by_row=TRUE){
+  if(by_row){
+    row_mean <- apply(data_in,1,mean)
+    row_sd   <- apply(data_in,1,sd)
+    output <- data_in
+    for(i in 1:dim(data_in)[1]){
+      output[i,] <- (data_in[i,] - row_mean[i])/row_sd[i]
+    }
+  }
+  #### if by column
+  if(!by_row){
+    col_mean <- apply(data_in,2,mean)
+    col_sd   <- apply(data_in,2,sd)
+    output <- data_in
+    for(i in 1:dim(data_in)[2]){
+      output[,i] <- (data_in[,i] - col_mean[i])/col_sd[i]
+    }
+  }
+  output
+}
+
+#### apply the normalization function
+## first normalized for each phase
+phase.score.norm1 <- flexible_normalization(phase.score,by_row=FALSE)
+## then normalized of each cell
+phase.score.norm2 <- flexible_normalization(phase.score.norm1,by_row=TRUE)
+
+#####################################################
+## Assign phase to each cell
+tmp = data.frame(Name= rownames(phase.score.norm2), phase.score.norm2)
+cell_phase <- apply(phase.score.norm2,1,function(x) {colnames(phase.score.norm2)[which.max(x)]})
+tmp$cell_phase = cell_phase
+
+ord.mat=rbind(dplyr::arrange(as.data.frame(tmp[cell_phase=="G1.S",]),desc(G1.S)),
+              dplyr::arrange(as.data.frame(tmp[cell_phase=="S",]),desc(S)),
+              dplyr::arrange(as.data.frame(tmp[cell_phase=="G2.M",]),desc(G2.M)),
+              dplyr::arrange(as.data.frame(tmp[cell_phase=="M",]),desc(M)),
+              dplyr::arrange(as.data.frame(tmp[cell_phase=="M.G1",]),desc(M.G1)))
+
+ord.mat$cell_phase = factor(ord.mat$cell_phase, levels=c("G1.S", "S", "G2.M","M", "M.G1"))
+
+## Heatmap of cell cycle scores with batch and phenotype info
+row.names(ord.mat) <- ord.mat$Name
+
+annotation_col = data.frame(Pheno=serie$pheno,
+                            Batch = as.factor(as.numeric(as.factor(serie$Sample.Date))))
+rownames(annotation_col) = serie$final.names
+
+ann_colors = list(Pheno = c(Low=mycols[2], High=mycols[1]))
+
+br = bluered(11)
+
+pheatmap(ord.mat[,2:6], annotation_row = annotation_col,
+         col=br, annotation_colors = ann_colors,
+         cluster_rows = F, cluster_cols = F, border_color = "black")
+
+
+```
+
+
+## PCA and correlation analysis
+
+```{r}
+
+norm <- logcounts(sce.hsc)
+ercc <- grep("ERCC-",rownames(norm))
+
+res.pca <- PCA(t(norm[-ercc,]),scale.unit=T, graph = F)
+
+tmp = data.frame(id = rownames(res.pca$ind$coord),
+                 res.pca$ind$coord,
+                 pheno=pheno)
+
+gg <- ggplot(tmp, aes(x=Dim.1,y=Dim.2,color=pheno)) + 
+         geom_point(size=3) +
+         stat_ellipse(type="norm") + 
+         theme_classic() + 
+         geom_text_repel(aes(label=id), size=3, 
+                        show.legend=FALSE, force=2) + 
+      theme(legend.position="none") + scale_color_manual(values = mycols[c(2,1)])
+gg + xlab("Dim 1") + ylab("Dim 2")
+
+```
+
+
+
+## Predicted trail-response signature
+ 
+aka differential expression, high vs low
+ 
+Differential analysis is performed using edgeR
+
+```{r}
+## prepare design matrix
+ercc = grep("ERCC-",rownames(sc))
+dge <- DGEList(counts=sc[-ercc,], group=serie$pheno)
+keep <- rowSums(sc[-ercc,]>5) > 5
+dge <- dge[keep,]
+#dim(dge)# 3095
+
+dge <- calcNormFactors(dge)
+serie$pheno = factor(serie$pheno, levels=c("Low","High"))
+design = model.matrix(~serie$pheno)
+#design
+colnames(design) = c("Int", "HighvsLow")
+
+## edgeR robust
+dge <- estimateGLMRobustDisp(dge, design = design)
+fit <- glmFit(dge, design = design) 
+lrt <- glmLRT(fit) 
+tt <- topTags(lrt, n = Inf) 
+
+#write.table(tt$table, file="Results_edgeR_Robust_GLM_FINAL_2020.xls", sep="\t",quote=F,col.names=NA) 
+
+res = tt$table
+```
+ 
+```{r}
+res = tt$table
+deg <- which(res$FDR<0.05)
+
+res$Geneid = rownames(res)
+mygenes <- sort(c( "PRSS56", "SIVA1", "SLC25A1", "DNM1L","C11orf83", "UBE2D4","BLOC1S1"))
+
+## set-up various filter for plotting labels
+res$toplot <- ifelse(res$FDR<0.05 ,1,0)
+res$toplot[res$Geneid %in% mygenes] <- 0
+
+res$target <- rep(0,nrow(res))
+res[mygenes,"target"] <- 1
+
+res$toplot2 <- ifelse(res$FDR<0.1 | res$Geneid %in% mygenes,1,0)
+
+gg <- ggplot(data=res, aes(x=logCPM, y=logFC)) +
+      geom_point(colour="grey") +
+      geom_point(data=subset(res,target==1),colour = "red", size=2) +
+      geom_text_repel(data=subset(res,target==1), aes(label=Geneid), size=3, 
+                      show.legend=FALSE, force=2) + 
+      theme_classic() +
+      theme(legend.position="none")
+gg + ggtitle("MA-plot: High vs Low")
+
+gg <- ggplot(data=res, aes(x=logFC, y=-log10(FDR))) +  
+      geom_point(color="grey") +
+      geom_point(data=subset(res,target==1),colour = "red", size=2) +
+      geom_text_repel(data=subset(res,target==1), aes(label=Geneid), size=3, 
+                      show.legend=FALSE, force=2) + 
+      theme_classic() +
+      theme(legend.position="none")
+gg + ggtitle("Volcano-plot: High vs Low")
+
+```
+
+
++ Heatmap of Differentially Expressed Genes
+
+
+```{r, fig.width=10, fig.height=12}
+res$toplot2 <- ifelse(res$FDR<0.1,1,0)
+
+annotation_col = data.frame(Pheno=serie$pheno)
+rownames(annotation_col) = serie$final.names
+
+ann_colors = list(Pheno = c(Low=mycols[2], High=mycols[1]))
+
+color.palette = colorRampPalette(c("midnightblue","dodgerblue3","white","goldenrod1","darkorange2"), space="Lab")(15)
+
+pheatmap(norm[res$Geneid[res$toplot2==1],],
+         scale="row",border_color = NA,
+         clustering_method = "ward.D",
+         cutree_cols = 2, cutree_rows = 3,
+         col=color.palette,
+         annotation_col = annotation_col, annotation_colors = ann_colors)
+
+```
+
+## sessionInfo
+```{r}
+sessionInfo()
+```
+
