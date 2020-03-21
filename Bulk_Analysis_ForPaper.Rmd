@@ -1,0 +1,782 @@
+---
+title: "Bulk_Analysis"
+author: "Agnes Paquet"
+date: "21/03/2020"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width = 8, fig.height = 6)
+```
+
+
+Note 1: Data files can be downloaded from Mendeley here:
+https://data.mendeley.com/datasets/m289yp5skd/draft?a=65157631-161f-40a6-a718-23b0f9e6fa58
+Data should remain private until this work is accepted for publication, please do not share without consent from the authors.
+
+Note 2: this code was developped under R 3.6.1. It was not tested on more recent versions of R.
+
+
+## Prepare individual bulk samples
+
+For each single sample:
+
+- Get the raw count data
+
+- Extract 700 cells randomly, and sum the counts fo all genes 2X
+
+- Perform differential analysis using edgeR LRT
+
+
+
+```{r, eval=FALSE}
+library(Seurat)
+library(edgeR)
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(ggrepel))
+library(gplots)
+
+## Load object, export all samples
+final <- readRDS("final_HTO_preprocess.rds")
+
+## Check that we have at least 1400 cells/sample: OK
+table(final@meta.data$HTO_classification)
+
+## Generate the bulk and save the count table
+hid = sort(as.vector(as.matrix(unique(final[["HTO_classification"]]))))
+
+set.seed(11052019)
+h = hid[1]
+tmp <- subset(final, subset = HTO_classification==h)
+ix1 = sample(x=1:ncol(tmp),size = 700,replace=F)
+ix2 = sample(x=c(1:ncol(tmp))[-ix1],size=700,replace=F)
+  
+cmat = data.frame(rowSums(as.matrix(tmp@assays$RNA@counts[,ix1])),
+                  rowSums(as.matrix(tmp@assays$RNA@counts[,ix2])))
+colnames(cmat) = paste(h,1:2,sep=".S")
+write.table(cmat,file=paste("Bulk",h,"txt",sep="."), sep="\t",quote=F,col.names=NA)
+
+fullcounts = cmat
+
+for(h in hid[2:5])
+{
+  tmp <- subset(final, subset = HTO_classification==h)
+  ix1 = sample(x=1:ncol(tmp),size = 700,replace=F)
+  ix2 = sample(x=c(1:ncol(tmp))[-ix1],size=700,replace=F)
+  
+  cmat = data.frame(rowSums(as.matrix(tmp@assays$RNA@counts[,ix1])),
+                    rowSums(as.matrix(tmp@assays$RNA@counts[,ix2])))
+  colnames(cmat) = paste(h,1:2,sep=".S")
+  write.table(cmat,file=paste("Bulk",h,"txt",sep="."), sep="\t",quote=F,col.names=NA)
+  if(all(rownames(fullcounts)==rownames(cmat)))
+    fullcounts = cbind(fullcounts,cmat)
+}
+
+head(fullcounts)
+
+
+```
+
+
+```{r}
+library(Seurat)
+library(edgeR)
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(ggrepel))
+library(gplots)
+
+b1 = read.delim("Bulk.A0251.txt", stringsAsFactors = F, check.names=F, row.names=1 )
+head(b1)
+b2 = read.delim("Bulk.A0252.txt", stringsAsFactors = F, check.names=F, row.names=1 )
+b3 = read.delim("Bulk.A0253.txt", stringsAsFactors = F, check.names=F, row.names=1 )
+b4 = read.delim("Bulk.A0254.txt", stringsAsFactors = F, check.names=F, row.names=1 )
+b5 = read.delim("Bulk.A0255.txt", stringsAsFactors = F, check.names=F, row.names=1 )
+
+## all(rownames(b1)==rownames(b4))
+
+fullcounts = cbind(b1,b2,b3,b4,b5)
+
+```
+
+# Exploratory graphs of the bulk data
+
+```{r}
+library(RColorBrewer)
+mycols = brewer.pal(9,"Set1")
+mycols = mycols[c(9,2,6,5,7)]
+mycols2 = rep(mycols,each=2)
+
+barplot(colSums(fullcounts)/10^6,las=2,main="Raw Counts (millions)",col=mycols2)
+boxplot(log2(fullcounts+1),col=mycols2)
+
+```
+
+```{r,fig.width=10,fig.height=10}
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...)
+{
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y))
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    txt <- paste0(prefix, txt)
+    if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor * r)
+}
+
+
+mypanel=function(x,y,...)
+{
+  points(x,y,pch=16,...)
+  abline(0,1,col=2)
+}
+
+pairs(log2(fullcounts + 1),panel=mypanel, lower.panel=panel.cor)
+
+```
+
+## Differential Expression
+
+```{r}
+serie = as.factor(substr(colnames(fullcounts),1,5))
+
+dge <- DGEList(fullcounts, group = serie) 
+keep <- rowSums(fullcounts>5) > 2 # 12509, no additional filtering required actually
+dge <- dge[keep,]
+
+dge <- calcNormFactors(dge) 
+
+## Create the design matrix 
+design <- model.matrix(~ serie)
+design
+colnames(design) = gsub("serie","",colnames(design))
+
+dge <- estimateDisp(dge, design = design) 
+
+fit <- glmFit(dge, design = design) 
+
+cpms = cpm(dge)
+
+```
+
+## TRAIL 50mn vs CTRL
+```{r}
+lrt1 <- glmLRT(fit, coef=2) 
+tt <- topTags(lrt1, n = Inf, sort.by = "none") 
+write.table(tt$table, file="Bulk_TRAIL.50mnvsCONTROL.xls", sep="\t",quote=F,col.names=NA)
+
+plotBCV(dge) 
+hist(tt$table$PValue, 50) 
+hist(tt$table$FDR, 50) 
+tt$table$Gene = rownames(tt$table)
+
+write.table(tt$table, file="DEresults_Trail_50mn_D20_vs_CTRL.xls", sep="\t", quote=F, row.names=F)
+
+tt$table$toplot <- rep(0,nrow(tt$table))
+tt$table$toplot[tt$table$FDR<0.05 ] <- 1
+
+gg <- ggplot(data=tt$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(color="grey", size=1) +
+      geom_point(data=subset(tt$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_text_repel(data=subset(tt$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=2, colour="blue") +
+    geom_hline(yintercept = c(-2,2), linetype=2, colour="red")
+gg + ggtitle("MA-plot: TRAIL 50mn vs Control")
+
+
+gg <- ggplot(data=tt$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      #geom_point(color="grey", size=1) +
+      #geom_point(data=subset(tt$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_text_repel(data=subset(tt$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=5) +
+    geom_hline(yintercept = c(-1,1), linetype=2, colour="red")
+gg + ggtitle("MA-plot: TRAIL 50mn vs Control")
+
+gg <- ggplot(data=tt$table, aes(x=logFC,
+                            y=-log10(FDR))) +  
+      #geom_point(color="grey", size=1) +
+      #geom_point(data=subset(tt$table,toplot==1),colour = "red", size=2) +
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      theme_bw() +
+      geom_text_repel(data=subset(tt$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=5) +
+      geom_hline(yintercept = -log10(0.05), linetype=2, colour="red")
+gg + ggtitle("Volcano-plot: TRAIL 50mn vs Control")
+
+ix = sort(rownames(tt$table[tt$table$toplot==1,]))
+
+pdf("DEresults_Bulk_Trail50_Ctrl_MA_Volcano.pdf", paper="a4")
+# MAplot, color and size by FDR
+gg <- ggplot(data=tt$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      #geom_point(color="grey", size=1) +
+      #geom_point(data=subset(tt$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_text_repel(data=subset(tt$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=5, colour="grey51") +
+    geom_hline(yintercept = c(-1,1), linetype=2, colour="red")
+gg + ggtitle("MA-plot: TRAIL 50mn vs Control")
+
+#Volcano, color and size by FDR
+gg <- ggplot(data=tt$table, aes(x=logFC,
+                            y=-log10(FDR))) +  
+      #geom_point(color="grey", size=1) +
+      #geom_point(data=subset(tt$table,toplot==1),colour = "red", size=2) +
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      theme_bw() +
+      geom_text_repel(data=subset(tt$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=5, colour="grey51") +
+      geom_hline(yintercept = -log10(0.05), linetype=2, colour="red")
+gg + ggtitle("Volcano-plot: TRAIL 50mn vs Control")
+dev.off()
+
+```
+
+# Barplot of DEG genes
+
+We can see that the changes in expression levels between the 2 condtions are very small.
+
+```{r}
+
+snames = c("CTRL","CTRL", "TRAIL 50mn", "TRAIL 50mn")
+for(i in 1:length(ix))
+{
+  barplot(log2(cpms[ix[i],1:4]+1),main=ix[i],las=2,col=mycols2[1:4], 
+          ylim=c(0,12), names=snames,las=2,
+          ylab="log2(CPM+1)")
+}  
+
+pdf("Barplot_DEG_Bulk_Trail50mn_Ctrl.pdf", width=12,height=12)
+op = par(mfrow=c(2,2))
+for(i in 1:length(ix))
+{
+  barplot(log2(cpms[ix[i],1:4]+1),main=ix[i],las=2,col=mycols2[1:4], 
+          ylim=c(0,12), names=snames,las=2,
+          ylab="log2(CPM+1)")
+}  
+dev.off()
+
+
+```
+
+
+## TRAIL 120mn D2 vs CTRL
+
+We start to see some induction of gene expression changes at 120mn, 20ng. We have about 50 genes with strong FDR, but no significant pathway
+induction after adjustment for multiple testing.
+
+
+```{r}
+lrt1 <- glmLRT(fit, coef=4) 
+tt1 <- topTags(lrt1, n = Inf,sort.by = "none") 
+tt1$table$Gene = rownames(tt1$table)
+
+write.table(tt1$table, file="TRAIL.120mnD20vsCONTROL.xls", sep="\t",quote=F,col.names=NA)
+
+plotBCV(dge) 
+hist(tt1$table$PValue, 50) 
+hist(tt1$table$FDR, 50) 
+
+tt1$table$toplot <- rep(0,nrow(tt1$table))
+#tt1$table$toplot[tt1$table$FDR<0.05 & abs(tt1$table$logFC)>0.7] <- 1
+tt1$table$toplot[tt1$table$FDR< 10^-6 & abs(tt1$table$logFC)>0.7] <- 1
+
+gg <- ggplot(data=tt1$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(color="grey", size=1) +
+      geom_point(data=subset(tt1$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_hline(yintercept = c(-1,1), linetype=2, colour="red") +
+      geom_text_repel(data=subset(tt1$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=2, colour="blue") 
+gg + ggtitle("MA-plot: TRAIL 120mn 20ng vs Control")
+
+gg <- ggplot(data=tt1$table, aes(x=logFC,
+                            y=-log10(FDR))) +  
+      geom_point(color="grey", size=1) +
+      geom_point(data=subset(tt1$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_text_repel(data=subset(tt1$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=2, colour="blue") +
+  geom_hline(yintercept = -log10(0.05), linetype=2, colour="red")
+gg + ggtitle("Volcano-plot: TRAIL 120mn 20ng vs Control")
+
+
+pdf("DEresults_Bulk_Trail120_D20_Ctrl_MA_Volcano.pdf", paper="a4")
+# MAplot, color and size by FDR
+gg <- ggplot(data=tt1$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      theme_bw() +
+      #geom_text_repel(data=subset(tt1$table,toplot==1) ,aes(label=Gene), size=4, 
+      #                show.legend=FALSE, force=5, colour="grey51") +
+    geom_hline(yintercept = c(-1,1), linetype=2, colour="red")
+gg + ggtitle("MA-plot: TRAIL 120mn 20ng vs Control")
+
+#Volcano, color and size by FDR
+gg <- ggplot(data=tt1$table, aes(x=logFC,
+                            y=-log10(FDR))) +  
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      theme_bw() +
+      #geom_text_repel(data=subset(tt1$table,toplot==1) ,aes(label=Gene), size=3, 
+      #                show.legend=FALSE, force=5, colour="grey51") +
+      geom_hline(yintercept = -log10(0.05), linetype=2, colour="red")
+gg + ggtitle("Volcano-plot: TRAIL 120mn 20ng vs Control")
+dev.off()
+
+```
+
+
+## Heatmap of DEG (larger set)
+
+```{r, fig.width=10,fig.height=14}
+myg = tt1$table$Gene[which(tt1$table$FDR<0.05 & abs(tt1$table$logFC)>0.8)]
+snames.120 = c("CTRL","CTRL", "TRAIL 120","TRAIL 120")
+
+pheatmap(log2(cpms[myg,c(1,2,7,8)]+1), scale = "row",col=bluered(21), labels_col = snames.120)
+
+#pdf("Bulk_Trail120mnD20_CTRL_Heatmap_DEG.pdf", paper="a4")
+pheatmap(log2(cpms[myg,c(1,2,7,8)]+1), scale = "row",col=bluered(21), labels_col = snames.120, 
+         filename="Bulk_Trail120mnD20_CTRL_Heatmap_DEG.pdf", height=15)
+#dev.off()
+
+```
+
+## FGSEA Trail 120 D2 vs Control
+```{r, fig.height=10}
+library(fgsea)
+library(tidyverse)
+## Note: Hallmark pathway and Kegg pathays must be dowloaded elsewhere first.
+pathways.hallmark <- gmtPathways("h.all.v6.2.symbols.gmt.txt")
+pathways.kegg <- gmtPathways("c2.cp.kegg.v6.2.symbols.gmt.txt")
+
+ranki <- deframe(tt1$table[,c("Gene","logFC")])
+print(head(ranki))
+
+fres <- fgsea(pathways=pathways.hallmark, stats=ranki, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+
+fres <- fgsea(pathways=pathways.kegg, stats=ranki, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres[fres$pval<0.1,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Top Kegg pathways NES from GSEA") + 
+  theme_minimal()
+
+```
+
+## TRAIL 120mn - high dose vs CTRL
+
+This is the positive control. We start to see a significant induction of gene expression in this condition.
+
+```{r}
+lrt2 <- glmLRT(fit, coef=5) 
+tt2 <- topTags(lrt2, n = Inf,sort.by = "none") 
+tt2$table$Gene = rownames(tt2$table)
+
+write.table(tt2$table, file="DEresults_TRAIL.120mnD40vsCONTROL.xls", sep="\t",quote=F,row.names=F)
+
+hist(tt2$table$PValue, 50) 
+hist(tt2$table$FDR, 50) 
+
+tt2$table$toplot <- rep(0,nrow(tt2$table))
+tt2$table$toplot[tt2$table$FDR< 10^-5 & abs(tt2$table$logFC)>0.7] <- 1
+
+gg <- ggplot(data=tt2$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(color="grey", size=1) +
+      geom_point(data=subset(tt2$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_hline(yintercept = c(-1,1), linetype=2, colour="red") +
+      geom_text_repel(data=subset(tt2$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=2, colour="blue")
+gg + ggtitle("MA-plot: TRAIL 120mn 40ng vs Control")
+
+gg <- ggplot(data=tt2$table, aes(x=logFC,
+                            y=-log10(FDR))) +  
+      geom_point(color="grey", size=1) +
+      geom_point(data=subset(tt2$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_hline(yintercept = -log10(0.05), linetype=2, colour="red") +
+      geom_text_repel(data=subset(tt2$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=2, colour="blue")
+gg + ggtitle("Volcano-plot: TRAIL 120mn 40ng  vs Control")
+
+
+
+pdf("DEresults_Bulk_Trail120_D40_Ctrl_MA_Volcano.pdf", paper="a4")
+# MAplot, color and size by FDR
+gg <- ggplot(data=tt2$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      theme_bw() +
+      #geom_text_repel(data=subset(tt2$table,toplot==1) ,aes(label=Gene), size=4, show.legend=FALSE, force=5, colour="grey51") +
+    geom_hline(yintercept = c(-1,1), linetype=2, colour="red")
+gg + ggtitle("MA-plot: TRAIL 120mn 40ng vs Control")
+
+#Volcano, color and size by FDR
+tt2$table$toplotFDR <- rep(0,nrow(tt2$table))
+tt2$table$toplotFDR[tt2$table$FDR< 10^-7 & abs(tt2$table$logFC)>0.5] <- 1
+
+gg <- ggplot(data=tt2$table, aes(x=logFC,
+                            y=-log10(FDR))) +  
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      theme_bw() +
+      #geom_text_repel(data=subset(tt2$table,toplotFDR==1) ,aes(label=Gene), size=3, 
+      #                show.legend=FALSE, force=5, colour="grey51") +
+      geom_hline(yintercept = -log10(0.05), linetype=2, colour="red")
+gg + ggtitle("Volcano-plot: TRAIL 120mn 40ng vs Control")
+dev.off()
+
+
+
+```
+
+
+
+### Heatmap of most significant DEG
+
+```{r, fig.width=10,fig.height=14}
+myg2 = tt2$table$Gene[which(tt2$table$FDR<0.05 & abs(tt2$table$logFC)>0.8)]
+myg2 = myg2[nchar(myg2)<10]
+
+pheatmap(log2(cpms[myg2,c(1,2,9,10)]+1), scale = "row",col=bluered(21))
+snames = c("CTRL", "CTRL", "TRAIL", "TRAIL")
+
+#pdf("Bulk_Trail120mnD40_CTRL_Heatmap_DEG.pdf", paper="a4")
+pheatmap(log2(cpms[myg2,c(1,2,9,10)]+1), scale = "row",col=bluered(21), labels_col = snames,
+         filename="Bulk_Trail120mnD40_CTRL_Heatmap_DEG.pdf", height=15)
+#dev.off()
+
+```
+
+### FGSEA Trail 120mn D40 vs Control
+```{r, fig.height=10}
+
+ranki <- deframe(tt2$table[,c("Gene","logFC")])
+print(head(ranki))
+fres <- fgsea(pathways=pathways.hallmark, stats=ranki, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+
+pdf("GSEA_Hallmark_Trail120_D40vsControl.pdf", paper="a4")
+fres <- fgsea(pathways=pathways.kegg, stats=ranki, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+dev.off()
+
+ggplot(fres[fres$pval<0.1,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Top KEGG pathways NES from GSEA") + 
+  theme_minimal()
+
+```
+
+
+## TRAIL 120mn - low dose vs CTRL
+
+
+```{r}
+lrt3 <- glmLRT(fit, coef=3) 
+tt3 <- topTags(lrt3, n = Inf,sort.by = "none") 
+tt3$table$Gene = rownames(tt3$table)
+
+write.table(tt3$table, file="DEresults_TRAIL.120mnD10vsCONTROL.xls", sep="\t",quote=F,row.names=F)
+
+hist(tt3$table$PValue, 50) 
+hist(tt3$table$FDR, 50) 
+
+tt3$table$toplot <- rep(0,nrow(tt3$table))
+tt3$table$toplot[tt3$table$FDR< 0.05 & abs(tt3$table$logFC)>0.7] <- 1
+
+gg <- ggplot(data=tt3$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(color="grey", size=1) +
+      geom_point(data=subset(tt3$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_hline(yintercept = c(-1,1), linetype=2, colour="red") +
+      geom_text_repel(data=subset(tt3$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=2, colour="blue")
+gg + ggtitle("MA-plot: TRAIL 120mn 10ng vs Control")
+
+gg <- ggplot(data=tt3$table, aes(x=logFC,
+                            y=-log10(FDR))) +  
+      geom_point(color="grey", size=1) +
+      geom_point(data=subset(tt3$table,toplot==1),colour = "red", size=2) +
+      theme_bw() +
+      geom_hline(yintercept = -log10(0.05), linetype=2, colour="red") +
+      geom_text_repel(data=subset(tt3$table,toplot==1) ,aes(label=Gene), size=3, 
+                      show.legend=FALSE, force=2, colour="blue")
+gg + ggtitle("Volcano-plot: TRAIL 120mn 10ng  vs Control")
+
+
+
+pdf("DEresults_Bulk_Trail120_D10_Ctrl_MA_Volcano.pdf", paper="a4")
+# MAplot, color and size by FDR
+gg <- ggplot(data=tt3$table, aes(x=logCPM,
+                            y=logFC)) +  
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      theme_bw() +
+      #geom_text_repel(data=subset(tt2$table,toplot==1) ,aes(label=Gene), size=4, show.legend=FALSE, force=5, colour="grey51") +
+    geom_hline(yintercept = c(-1,1), linetype=2, colour="red")
+gg + ggtitle("MA-plot: TRAIL 120mn 10ng vs Control")
+
+#Volcano, color and size by FDR
+
+gg <- ggplot(data=tt3$table, aes(x=logFC,
+                            y=-log10(FDR))) +  
+      geom_point(aes(color=-log10(FDR), size=-log10(FDR))) +
+      theme_bw() +
+      #geom_text_repel(data=subset(tt2$table,toplotFDR==1) ,aes(label=Gene), size=3, 
+      #                show.legend=FALSE, force=5, colour="grey51") +
+      geom_hline(yintercept = -log10(0.05), linetype=2, colour="red")
+gg + ggtitle("Volcano-plot: TRAIL 120mn 10ng vs Control")
+dev.off()
+
+ranki <- deframe(tt3$table[,c("Gene","logFC")])
+print(head(ranki))
+fres <- fgsea(pathways=pathways.hallmark, stats=ranki, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+
+```
+
+# Comparison of differential analysis results
+
+```{r, fig.height=8, fig.width=8}
+
+library(gplots)
+
+Trail50mn.D20=tt$table$Gene[tt$table$FDR<0.05] 
+
+Trail120mn.D20=tt1$table$Gene[tt1$table$FDR<0.05] 
+Trail120mn.D10=tt3$table$Gene[tt3$table$FDR<0.05]
+Trail120mn.D40=tt2$table$Gene[tt2$table$FDR<0.05]
+
+vn = venn(list(Trail50mn.D20=Trail50mn.D20, Trail120mn.D20=Trail120mn.D20), intersections = T)
+
+vn2 = venn(list(Trail120mn.D20=Trail120mn.D20,Trail120mn.D10=Trail120mn.D10,Trail120mn.D40=Trail120mn.D40), intersections = T)
+intersections<-attr(vn2,"intersections")
+trail.genes = intersections[["Trail120mn.D20:Trail120mn.D10:Trail120mn.D40"]]
+
+
+```
+
+### Heatmap of trail induced genes
+
+```{r, fig.width=10, fig.height=20}
+
+snames.all = rep(c("CTRL","T.50mn.D20","T.120mn.D10","T.120mn.D20","T.120mn.D40"), each=2)
+pheatmap(log2(cpms[trail.genes,]+1), scale = "row", cluster_cols = F, 
+         col=bluered(21), labels_col = snames.all, show_rownames = F)
+
+pheatmap(log2(cpms[trail.genes,]+1), scale = "row", cluster_cols = F, 
+         col=bluered(21), labels_col = snames.all, show_rownames = T)
+
+#pdf("Heatmap_Trail_DEG_allconditions.pdf", paper='a4')
+pheatmap(log2(cpms[trail.genes,]+1), scale = "row", cluster_cols = F, 
+         col=bluered(21), labels_col = snames.all, show_rownames = F,
+         filename="Heatmap_Trail_DEG_allconditions.pdf", height=10)
+#dev.off()
+
+pheatmap(log2(cpms[trail.genes,]+1), scale = "row", cluster_cols = F, 
+         #filename="Heatmap_Trail_DEG_allconditions_withNames.pdf",
+         height=18,width=15,border_color=NA,
+         col=bluered(21), labels_col = snames.all, show_rownames = T,fontsize_row =6)
+
+
+tres = data.frame(tt$table[trail.genes,c("logFC","logCPM","PValue","FDR")],
+                  tt1$table[trail.genes,c("logFC","logCPM","PValue","FDR")],
+                  tt3$table[trail.genes,c("logFC","logCPM","PValue","FDR")],
+                  tt2$table[trail.genes,c("logFC","logCPM","PValue","FDR")]
+                  )
+head(tres)
+tres.colnames = c("logFC_TRAIL.50mn.25ngvsCTRL","logCPM_TRAIL.50mnvsCTRL","PValue_TRAIL.50mnvsCTRL","FDR_TRAIL.50mnvsCTRL",
+                  "logFC_TRAIL.120mn.10ngvsCTRL","logCPM_TRAIL.120mn.10ngvsCTRL","PValue_TRAIL.120mn.10ngvsCTRL","FDR_TRAIL.120mn.10ngvsCTRL",
+                  "logFC_TRAIL.120mn.25ngvsCTRL","logCPM_TRAIL.120mn.25ngvsCTRL","PValue_TRAIL.120mn.25ngvsCTRL","FDR_TRAIL.120mn.25ngvsCTRL",
+                  "logFC_TRAIL.120mn.40ngvsCTRL","logCPM_TRAIL.120mn.40ngvsCTRL","PValue_TRAIL.120mn.40ngvsCTRL","FDR_TRAIL.120mn.40ngvsCTRL")
+colnames(tres) = tres.colnames
+
+write.table(tres, file="TRAIL_Bulk_DEG_fromHeatmap.xls",
+            sep="\t", quote=F,col.names=NA)
+
+trail.genes[trail.genes %in% pathways.hallmark$HALLMARK_TNFA_SIGNALING_VIA_NFKB]
+# [1] "JUN"     "GADD45A" "CYR61"   "EFNA1"   "BTG2"    "ATF3"    "FOSL2"   "REL"     "DUSP2"   "NR4A2"   "NFE2L2"  "HES1"    "NFKB1"   "EGR1"   
+#[15] "DUSP1"   "EDN1"    "PNRC1"   "SGK1"    "DUSP4"   "CEBPD"   "MYC"     "FJX1"    "BIRC3"   "MAP3K8"  "DUSP5"   "OLR1"    "PHLDA1"  "BTG1"   
+#[29] "SMAD3"   "MAP2K3"  "EIF1"    "SOCS3"   "BMP2"    "SDC4"    "CEBPB"   "LDLR"    "IER2"    "RELB"   
+
+```
+
+
+
+## Heatmap of pathways of interest with exposure time increase
+
+### HALLMARK_TNFA_SIGNALING_VIA_NFKB
+
+```{r, fig.width=10, fig.height=20}
+gg = pathways.hallmark$HALLMARK_TNFA_SIGNALING_VIA_NFKB
+gg = gg[which(gg %in% rownames(cpms))]
+
+pheatmap(log2(cpms[gg,c(1:4,7,8)]+1), scale = "row", cluster_cols = F, col=bluered(21), 
+         labels_col = snames.all[c(1:4,7,8)])
+
+```
+
+### HALLMARK_APOPTOSIS
+
+```{r, fig.width=10, fig.height=16}
+gg = pathways.hallmark$HALLMARK_APOPTOSIS
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:4,7,8)]+1), scale = "row", cluster_cols = F, col=bluered(21),labels_col = snames.all[c(1:4,7,8)])
+
+```
+
+
+### HALLMARK_INFLAMMATORY_RESPONSE
+
+```{r, fig.width=10, fig.height=15}
+gg = pathways.hallmark$HALLMARK_INFLAMMATORY_RESPONSE
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:4,7,8)]+1), scale = "row", cluster_cols = F, col=bluered(21),labels_col = snames.all[c(1:4,7,8)])
+
+```
+
+
+### HALLMARK_OXIDATIVE_PHOSPHORYLATION
+
+```{r, fig.width=10, fig.height=20}
+gg = pathways.hallmark$HALLMARK_OXIDATIVE_PHOSPHORYLATION
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:4,7,8)]+1), scale = "row", cluster_cols = F, col=bluered(21),labels_col = snames.all[c(1:4,7,8)])
+
+```
+
+
+### HALLMARK_INTERFERON_ALPHA_RESPONSE
+
+```{r, fig.width=10, fig.height=16}
+gg = pathways.hallmark$HALLMARK_INTERFERON_ALPHA_RESPONSE
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:4,7,8)]+1), scale = "row", cluster_cols = F, col=bluered(21),labels_col = snames.all[c(1:4,7,8)])
+
+```
+
+### HALLMARK_DNA_REPAIR
+
+```{r, fig.width=10, fig.height=16}
+gg = pathways.hallmark$HALLMARK_DNA_REPAIR
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:4,7,8)]+1), scale = "row", cluster_cols = F, col=bluered(21),labels_col = snames.all[c(1:4,7,8)])
+
+```
+
+
+
+## Heatmap of pathways of interest with dose increase
+
+### HALLMARK_TNFA_SIGNALING_VIA_NFKB
+
+```{r, fig.width=10, fig.height=20}
+gg = pathways.hallmark$HALLMARK_TNFA_SIGNALING_VIA_NFKB
+gg = gg[which(gg %in% rownames(cpms))]
+
+pheatmap(log2(cpms[gg,c(1:2,5:10)]+1), scale = "row", cluster_cols = F, col=bluered(21), 
+         labels_col = snames.all[c(1:2,5:10)])
+
+```
+
+### HALLMARK_APOPTOSIS
+
+```{r, fig.width=10, fig.height=16}
+gg = pathways.hallmark$HALLMARK_APOPTOSIS
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:2,5:10)]+1), scale = "row", cluster_cols = F, col=bluered(21), 
+         labels_col = snames.all[c(1:2,5:10)])
+
+```
+
+
+### HALLMARK_INFLAMMATORY_RESPONSE
+
+```{r, fig.width=10, fig.height=15}
+gg = pathways.hallmark$HALLMARK_INFLAMMATORY_RESPONSE
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:2,5:10)]+1), scale = "row", cluster_cols = F, col=bluered(21), 
+         labels_col = snames.all[c(1:2,5:10)])
+
+```
+
+
+### HALLMARK_OXIDATIVE_PHOSPHORYLATION
+
+```{r, fig.width=10, fig.height=20}
+gg = pathways.hallmark$HALLMARK_OXIDATIVE_PHOSPHORYLATION
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:2,5:10)]+1), scale = "row", cluster_cols = F, col=bluered(21), 
+         labels_col = snames.all[c(1:2,5:10)])
+
+```
+
+
+### HALLMARK_INTERFERON_ALPHA_RESPONSE
+
+```{r, fig.width=10, fig.height=16}
+gg = pathways.hallmark$HALLMARK_INTERFERON_ALPHA_RESPONSE
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:2,5:10)]+1), scale = "row", cluster_cols = F, col=bluered(21), 
+         labels_col = snames.all[c(1:2,5:10)])
+
+```
+
+### HALLMARK_DNA_REPAIR
+
+```{r, fig.width=10, fig.height=16}
+gg = pathways.hallmark$HALLMARK_DNA_REPAIR
+gg = gg[which(gg %in% rownames(cpms))]
+pheatmap(log2(cpms[gg,c(1:2,5:10)]+1), scale = "row", cluster_cols = F, col=bluered(21), 
+         labels_col = snames.all[c(1:2,5:10)])
+
+```
+

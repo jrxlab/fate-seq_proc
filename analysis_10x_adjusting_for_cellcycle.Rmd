@@ -1,0 +1,610 @@
+---
+title: "analysis_10Xdata"
+author: "Agnes Paquet"
+date: "21/03/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+Note 1: Data files can be downloaded from Mendeley here:
+https://data.mendeley.com/datasets/m289yp5skd/draft?a=65157631-161f-40a6-a718-23b0f9e6fa58
+Data should remain private until this work is accepted for publication, please do not share without consent from the authors.
+
+Note 2: this code was developped under R 3.6.1. It was not tested using more recent versions of R.
+
+## Integration of CTRL, TRAIL_50mn and TRAIL 2H samples, and CTRl, TRAIL_50mn_dose1, TRAIL_50mn_dose2 
+
+We are starting from the cell hashing data, after demultiplexing and cleaning. 
+Data are available in a .rds file.
+
+Preprocessing of all indiviudal samples:
+- Extract the cell corresponding to each hashtag
+- Set the stim parameter to the experimental condition
+- Follow Seurat standard pipeline: 
++ Normalize to 10,000
++ Reduction of the number of features (vst, n=2,000 genes)
+
+Final object is saved in a new .rds file.
+
+Barcode correspondance 
+A0251=CTRL
+A0252=TRAIL 50mn, 25 ng
+A0253=TRAIL 120mn, 10 ng
+A0254=TRAIL 120mn, 25 ng
+A0255=TRAIL 120mn, 40 ng
+
+Please check paper for exact concentration values, as the data entered in the code might not be exact.
+
+```{r}
+library(Seurat)
+library(pheatmap)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+ 
+library(ggrepel)
+library(tidyverse)
+library(fgsea)
+
+
+```
+
+```{r, eval=T}
+## This part is now saved as a .rds file for speed
+
+
+## Load object, export all samples
+final <- readRDS("final_HTO_preprocess.rds")
+
+ctrl <- subset(final, subset = HTO_classification=="A0251")
+ctrl$stim <- "CTRL"
+ctrl <- NormalizeData(ctrl, verbose = FALSE)
+ctrl <- FindVariableFeatures(ctrl, selection.method = "vst", nfeatures = 2000)
+
+t1 <- subset(final, subset = HTO_classification=="A0252")
+t1$stim <- "TRAIL.50mn.d20"
+t1 <- NormalizeData(t1, verbose = FALSE)
+t1 <- FindVariableFeatures(t1, selection.method = "vst", nfeatures = 2000)
+
+t2 <- subset(final, subset = HTO_classification=="A0253")
+t2$stim <- "TRAIL.120mn.d10"
+t2 <- NormalizeData(t2, verbose = FALSE)
+t2 <- FindVariableFeatures(t2, selection.method = "vst", nfeatures = 2000)
+
+t3 <- subset(final, subset = HTO_classification=="A0254")
+t3$stim <- "TRAIL.120mn.d20"
+t3 <- NormalizeData(t3, verbose = FALSE)
+t3 <- FindVariableFeatures(t3, selection.method = "vst", nfeatures = 2000)
+
+t4 <- subset(final, subset = HTO_classification=="A0255")
+t4$stim <- "TRAIL.120mn.d40"
+t4 <- NormalizeData(t4, verbose = FALSE)
+t4 <- FindVariableFeatures(t4, selection.method = "vst", nfeatures = 2000)
+
+
+## Integrate the data
+
+#We use the Seurat integration function here. First thing we try is all 5 samples together.
+#dims=20.
+#It's quite long to run.
+fib.anchors <- FindIntegrationAnchors(object.list = list(ctrl,t1,t2,t3,t4), dims = 1:20)
+int <- IntegrateData(anchorset = fib.anchors, dims = 1:20)
+
+## Run the analysis on the integrated dataset
+# switch to integrated assay. The variable features of this assay are
+# automatically set during IntegrateData
+DefaultAssay(object = int) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+## First, we try without the cell cycle regression.
+int <- ScaleData(object = int, verbose = FALSE, vars.to.regress = c("G2M.Score", "S.Score", "nCount_RNA"))
+
+int <- RunPCA(object = int, npcs = 30, verbose = FALSE)
+ElbowPlot(int) # we can pick 7 dims
+
+int <- RunUMAP(object = int, reduction = "pca", dims = 1:7)
+DimPlot(object = int, reduction = "umap", group.by = "stim")
+
+int <- FindNeighbors(object = int, dims=1:7, do.plot=T)
+int <- FindClusters(object = int, res=0.1)
+DimPlot(object = int, reduction = "umap",label = T, label.size = 8)
+
+tt =table(int@meta.data$integrated_snn_res.0.1, int$stim)
+tt
+round(tt*100/rowSums(tt),1)
+
+VlnPlot(int,"nCount_RNA")
+VlnPlot(int,"G2M.Score")
+VlnPlot(int,"S.Score")
+
+DimPlot(object = int, reduction = "umap",label = T, label.size = 8, split.by = 'stim')
+int[["clusterV3"]] <- Idents(object = int)
+
+saveRDS(int, file="integrated_cycle_corrected.rds")
+
+```
+
+## Reads processed data if needed
+```{r}
+int <- readRDS("integrated_cycle_corrected.rds")
+
+```
+
+```{r, fig.width=15,fig.height=9}
+
+FeaturePlot(object = int, c("CDK1","UBE2C","TOP2A","CENPF", "HIST1H4C","MKI67"))
+
+```
+
+```{r}
+FeaturePlot(object = int, c("LDHA","GAPDH"))
+
+##Idents(object = int) <- int$clusterV3
+
+VlnPlot(object = int, c("CDK1","UBE2C","TOP2A","CENPF", "HIST1H4C"))
+
+  
+```
+
+
+
+# GSEA on the markers of cluster 2 and 3
+Note: we find mostly cell cyle genesm mitotic_spindle genes, and metabolism/glycolysis genes.
+Note: not run 
+```{r, eval=F}
+markers = FindAllMarkers(int)
+
+library(fgsea)
+library(tidyverse)
+
+## Note the Hallmark Pathway file and KEGG pathways must be downloaded elsewhere
+pathways.hallmark <- gmtPathways("h.all.v6.2.symbols.gmt.txt")
+pathways.kegg <- gmtPathways("c2.cp.kegg.v6.2.symbols.gmt.txt")
+
+## MA-plot from average matrix
+c2.mark = markers[markers$cluster==2,]
+c2.mark
+
+ranki <- deframe(c2.mark[,c("gene","avg_logFC")])
+print(head(ranki))
+fres <- fgsea(pathways=pathways.hallmark, stats=ranki, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 2") + 
+  theme_minimal()
+
+c3.mark = markers[markers$cluster==3,]
+c3.mark
+
+ranki <- deframe(c3.mark[,c("gene","avg_logFC")])
+print(head(ranki))
+fres <- fgsea(pathways=pathways.hallmark, stats=ranki, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 3") + 
+  theme_minimal()
+
+
+ranki <- deframe(c3.mark[,c("gene","avg_logFC")])
+print(head(ranki))
+fres <- fgsea(pathways=pathways.kegg, stats=ranki, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+fres = fres[fres$pval<0.1,]
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Top KEGG pathways NES from GSEA, cluster 3") + 
+  theme_minimal()
+
+
+
+```
+
+
+## Set the groups to the experimental condition
+# Then run the differential analysis for the comp of interest
+
+```{r}
+Idents(object = int) <- int$stim
+levels(int)
+
+deg1 = FindMarkers(int, ident.1 = "TRAIL.50mn.d20", ident.2 = "CTRL", min.pct = 0.5, logfc.threshold = 0.1)
+deg1
+
+deg2 = FindMarkers(int, ident.1 = "TRAIL.120mn.d20", ident.2 = "CTRL", min.pct = 0.5, logfc.threshold = 0.1)
+deg2
+
+deg3 = FindMarkers(int, ident.1 = "TRAIL.120mn.d40", ident.2 = "CTRL", min.pct = 0.5, logfc.threshold = 0.1)
+deg3
+
+```
+
+
+
+##  UMAP CTRL + 50mnD20 + 120mnD20
+```{r}
+Idents(object = int) <- int$stim
+levels(int)
+sub1 = subset(int, idents = c("CTRL","TRAIL.50mn.d20","TRAIL.120mn.d20"))
+sub1$stim <- factor(sub1$stim, levels=c("CTRL","TRAIL.50mn.d20","TRAIL.120mn.d20"))
+sub1[["clusterV3"]] <- Idents(object = sub1)
+
+sub = subset(int, idents = c("CTRL","TRAIL.50mn.d20"))
+
+DimPlot(sub1,pt.size=2)
+DimPlot(sub1,pt.size=2, split.by = "stim")
+
+## PDF UMAPs by exp condition
+pdf("UMAP_CTRL_TR50D20_TR120D20_byStim.pdf", paper="a4")
+DimPlot(sub1,pt.size=2)
+DimPlot(sub1,pt.size=2, split.by = "stim")
+dev.off()
+
+DimPlot(sub,pt.size=2)
+DimPlot(sub,pt.size=2, split.by = "stim")
+
+pdf("UMAP_CTRL_TR50D20_byStim.pdf", paper="a4")
+DimPlot(sub,pt.size=2)
+DimPlot(sub,pt.size=2, split.by = "stim")
+dev.off()
+
+## PDF UMAPs by cluster
+
+Idents(object = sub) <- int$clusterV3
+Idents(object = sub1) <- int$clusterV3
+
+sub1$stim <- factor(sub1$stim, levels=c("CTRL","TRAIL.50mn.d20","TRAIL.120mn.d20"))
+
+DimPlot(sub1,pt.size=2)
+DimPlot(sub1,pt.size=2, split.by = "stim")
+
+pdf("UMAP_CTRL_TR50D20_TR120D20_byStim_withClusters.pdf", paper="a4")
+DimPlot(sub1,pt.size=2)
+DimPlot(sub1,pt.size=2, split.by = "stim")
+dev.off()
+
+DimPlot(sub,pt.size=2)
+DimPlot(sub,pt.size=2, split.by = "stim")
+
+pdf("UMAP_CTRL_TR50D20_byStim_withClusters.pdf", paper="a4")
+DimPlot(sub,pt.size=2)
+DimPlot(sub,pt.size=2, split.by = "stim")
+dev.off()
+
+
+```
+
+##Markers and UMAP for each sample
+```{r}
+s1 =  subset(int, subset = stim=="CTRL") 
+Idents(s1) = "clusterV3"
+m1=FindAllMarkers(s1)
+top5 <- m1 %>% group_by(cluster) %>% top_n(5, avg_logFC)
+top10 <- m1 %>% group_by(cluster) %>% top_n(10, avg_logFC)
+top20 <- m1 %>% group_by(cluster) %>% top_n(20, avg_logFC)
+
+table(m1$cluster)
+
+library(gplots)
+
+DoHeatmap(object = s1, features = top10$gene)
+
+pdf("Heatmap_CTRL_allcells.pdf", width=10,height=8, useDingbats = F)
+DoHeatmap(object = s1, features = top10$gene, raster=F)
+dev.off()
+
+DoHeatmap(object = s1, features = top10$gene) + scale_fill_gradientn(colors = c("blue", "white", "red"))
+
+pdf("Heatmap_CTRL_allcells_redblue.pdf", width=10,height=8, useDingbats = F)
+DoHeatmap(object = s1, features = top10$gene, raster=F) + scale_fill_gradientn(colors = c("blue", "white", "red"))
+dev.off()
+
+
+
+```
+
+
+
+```{r}
+s2 =  subset(int, subset = stim=="TRAIL.50mn.d20") 
+Idents(s2) = "clusterV3"
+m2=FindAllMarkers(s2)
+top10 <- m2 %>% group_by(cluster) %>% top_n(10, avg_logFC)
+
+table(m2$cluster)
+
+DoHeatmap(object = s2, features = top10$gene)
+
+pdf("Heatmap_TR50mnD20_allcells.pdf", width=10,height=8, useDingbats = F)
+DoHeatmap(object = s2, features = top10$gene, raster=F)
+dev.off()
+
+DimPlot(s2, pt.size=2)
+
+DoHeatmap(object = s2, features = top10$gene) + scale_fill_gradientn(colors = c("blue", "white", "red"))
+
+pdf("Heatmap_TR50mnD20_allcells_redblue.pdf", width=10,height=8, useDingbats = F)
+DoHeatmap(object = s2, features = top10$gene, raster=F) + scale_fill_gradientn(colors = c("blue", "white", "red"))
+dev.off()
+
+write.table(m2, file="ClusterMarkers-TR50mnD20_V3.txt", sep="\t",quote=F,row.names=T)
+```
+
+
+```{r}
+s3 =  subset(int, subset = stim=="TRAIL.120mn.d20") 
+Idents(s3) = "clusterV3"
+m3=FindAllMarkers(s3)
+top10 <- m3 %>% group_by(cluster) %>% top_n(10, avg_logFC)
+
+table(m3$cluster)
+
+DoHeatmap(object = s3, features = top10$gene)
+
+pdf("Heatmap_TR120mnD20_allcells.pdf", width=12,height=10)
+DoHeatmap(object = s3, features = top10$gene)
+dev.off()
+
+DoHeatmap(object = s3, features = top10$gene) + scale_fill_gradientn(colors = c("blue", "white", "red"))
+
+pdf("Heatmap_TR120mnD20_allcells_redblue.pdf", width=12,height=10)
+DoHeatmap(object = s3, features = top10$gene) + scale_fill_gradientn(colors = c("blue", "white", "red"))
+dev.off()
+
+write.table(m3, file="ClusterMarkers-TR50mnD20_V3.txt", sep="\t",quote=F,row.names=T)
+```
+
+## markers, CTRL + 50mn together
+```{r}
+sub = subset(int, subset=stim %in% c("CTRL","TRAIL.50mn.d20"))
+Idents(sub) = "clusterV3"
+
+mm = FindAllMarkers(sub)
+top10 <- mm %>% group_by(cluster) %>% top_n(10, avg_logFC)
+top20 <- mm %>% group_by(cluster) %>% top_n(20, avg_logFC)
+
+table(mm$cluster)
+
+cluster.averages <- AverageExpression(object = sub, return.seurat = TRUE, add.ident = "stim",assay="RNA" )
+
+DoHeatmap(object = cluster.averages, features = top20$gene)
+
+pdf("Heatmap_CTRL_TR50mnD20_averages.pdf", width=8,height=8, useDingbats = F)
+DoHeatmap(object = cluster.averages, features = top20$gene, raster=F)
+dev.off()
+
+
+pdf("Heatmap_CTRL_TR50mnD20_average_redblue.pdf", width=8,height=12)
+DoHeatmap(object = sub, features = top20$gene) #+ scale_fill_gradientn(colors = c("blue", "white", "red"))
+dev.off()
+
+
+write.table(mm, file="ClusterMarkers-CTRL_TR50mnD20_V3.txt", sep="\t",quote=F,row.names=T)
+
+```
+
+## GSEA analysis for the cluster markers
+```{r, fig.height=10}
+library(fgsea)
+library(tidyverse)
+pathways.hallmark <- gmtPathways("h.all.v6.2.symbols.gmt.txt")
+pathways.kegg <- gmtPathways("c2.cp.kegg.v6.2.symbols.gmt.txt")
+
+rankc0 <- deframe(mm[mm$cluster==0,c("gene","avg_logFC")])
+print(head(rankc0))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc0, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 0 vs other") + 
+  theme_minimal()
+
+
+rankc1 <- deframe(mm[mm$cluster==1,c("gene","avg_logFC")])
+print(head(rankc1))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc1, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 1 vs other") + 
+  theme_minimal()
+
+
+fres <- fgsea(pathways=pathways.kegg, stats=rankc1, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres[fres$pval<0.1,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 1 vs other") + 
+  theme_minimal()
+
+
+rankc2 <- deframe(mm[mm$cluster==2,c("gene","avg_logFC")])
+print(head(rankc2))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc2, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 2 vs other") + 
+  theme_minimal()
+
+
+fres <- fgsea(pathways=pathways.kegg, stats=rankc2, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres[fres$pval<0.1,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 1 vs other") + 
+  theme_minimal()
+
+```
+
+
+
+## GSEA analysis for the cluster markers. CTRL sample alone
+```{r, fig.height=10}
+library(fgsea)
+library(tidyverse)
+pathways.hallmark <- gmtPathways("h.all.v6.2.symbols.gmt.txt")
+pathways.kegg <- gmtPathways("c2.cp.kegg.v6.2.symbols.gmt.txt")
+
+rankc0 <- deframe(m1[m1$cluster==0,c("gene","avg_logFC")])
+print(head(rankc0))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc0, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 0 vs other") + 
+  theme_minimal()
+
+
+rankc1 <- deframe(m1[m1$cluster==1,c("gene","avg_logFC")])
+print(head(rankc1))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc1, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 1 vs other") + 
+  theme_minimal()
+
+
+rankc2 <- deframe(m1[m1$cluster==2,c("gene","avg_logFC")])
+print(head(rankc2))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc2, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 2 vs other") + 
+  theme_minimal()
+
+
+
+```
+
+
+
+
+
+
+## GSEA analysis for the cluster markers. TRAIL T50 D20 sample alone
+```{r, fig.height=10}
+
+rankc0 <- deframe(m2[m2$cluster==0,c("gene","avg_logFC")])
+print(head(rankc0))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc0, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 0 vs other") + 
+  theme_minimal()
+
+
+rankc1 <- deframe(m2[m2$cluster==1,c("gene","avg_logFC")])
+print(head(rankc1))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc1, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 1 vs other") + 
+  theme_minimal()
+
+
+rankc2 <- deframe(m2[m2$cluster==2,c("gene","avg_logFC")])
+print(head(rankc2))
+fres <- fgsea(pathways=pathways.hallmark, stats=rankc2, nperm=1000)
+fres <- fres %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+print(fres)
+
+ggplot(fres, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.1)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA, cluster 2 vs other") + 
+  theme_minimal()
+
+
+
+```
+
