@@ -1,5 +1,5 @@
 # Single-cell analyses for fate-seq
-*presented in the article introducing fate-seq [(Meyer, Paquet et al., Cell Systems 2020](https://www.cell.com/cell-systems/fulltext/S2405-4712(20)30330-6)*
+*presented in the article introducing fate-seq [(Meyer, Paquet et al., Cell Systems 2020)](https://www.cell.com/cell-systems/fulltext/S2405-4712(20)30330-6)*
 
 **Note 1**: Data files can be downloaded from Mendeley [here](https://data.mendeley.com/datasets/m289yp5skd/draft?a=65157631-161f-40a6-a718-23b0f9e6fa58).
 Data should remain private until this work is accepted for publication, please do not share without consent from the authors.
